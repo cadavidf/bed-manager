@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Book a Bed</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #f5f5f5; display: flex; justify-content: center; padding: 2rem 1rem; }
+    .widget { background: #fff; border-radius: 12px; box-shadow: 0 2px 16px rgba(0,0,0,.1); max-width: 480px; width: 100%; padding: 2rem; }
+    h2 { margin-bottom: 1.5rem; font-size: 1.4rem; color: #111; }
+    label { display: block; font-size: .85rem; font-weight: 600; color: #444; margin-bottom: .3rem; margin-top: 1rem; }
+    input, select { width: 100%; padding: .6rem .8rem; border: 1px solid #ddd; border-radius: 6px; font-size: .95rem; }
+    input:focus, select:focus { outline: none; border-color: #4f8ef7; box-shadow: 0 0 0 2px rgba(79,142,247,.2); }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    #availability-results { margin-top: 1.5rem; }
+    .bed-card { border: 1px solid #eee; border-radius: 8px; padding: 1rem; margin-bottom: .75rem; cursor: pointer; transition: border-color .2s; }
+    .bed-card:hover, .bed-card.selected { border-color: #4f8ef7; background: #f0f6ff; }
+    .bed-card h4 { font-size: .95rem; margin-bottom: .2rem; }
+    .bed-card p { font-size: .8rem; color: #666; }
+    .bed-card .price { font-weight: 700; color: #222; margin-top: .4rem; }
+    #guest-form { margin-top: 1.5rem; display: none; }
+    .btn { width: 100%; margin-top: 1.25rem; padding: .75rem; background: #4f8ef7; color: #fff; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+    .btn:hover { background: #3a7de0; }
+    .btn:disabled { background: #aaa; cursor: not-allowed; }
+    #message { margin-top: 1rem; padding: .75rem 1rem; border-radius: 6px; font-size: .9rem; display: none; }
+    #message.success { background: #e6f9ee; color: #1a7a3c; border: 1px solid #a3d9b5; }
+    #message.error   { background: #fde8e8; color: #b91c1c; border: 1px solid #f5a0a0; }
+  </style>
+</head>
+<body>
+<div class="widget">
+  <h2>Check Availability &amp; Book</h2>
+
+  <div class="row">
+    <div>
+      <label for="check-in">Check-in</label>
+      <input type="date" id="check-in" />
+    </div>
+    <div>
+      <label for="check-out">Check-out</label>
+      <input type="date" id="check-out" />
+    </div>
+  </div>
+
+  <button class="btn" id="search-btn" onclick="searchAvailability()">Search</button>
+
+  <div id="availability-results"></div>
+
+  <div id="guest-form">
+    <h3 style="margin-bottom:.5rem;font-size:1rem;">Your Details</h3>
+    <div class="row">
+      <div>
+        <label for="first-name">First Name</label>
+        <input type="text" id="first-name" placeholder="Jane" />
+      </div>
+      <div>
+        <label for="last-name">Last Name</label>
+        <input type="text" id="last-name" placeholder="Smith" />
+      </div>
+    </div>
+    <label for="email">Email</label>
+    <input type="email" id="email" placeholder="jane@example.com" />
+    <label for="phone">Phone (optional)</label>
+    <input type="tel" id="phone" placeholder="+1 555 000 0000" />
+    <label for="notes">Notes (optional)</label>
+    <input type="text" id="notes" placeholder="Any requests?" />
+    <button class="btn" id="book-btn" onclick="submitBooking()">Confirm Booking</button>
+  </div>
+
+  <div id="message"></div>
+</div>
+
+<script>
+  // ── Configuration ───────────────────────────────────────────────────────────
+  // When embedding on an external site, set these two values:
+  const API_BASE    = (window.BED_MANAGER_API || 'http://localhost:13377');
+  const WEBHOOK_SECRET = (window.BED_MANAGER_SECRET || 'change-me');
+  const PROPERTY_ID = (window.BED_MANAGER_PROPERTY || null); // optional filter
+
+  let selectedBed = null;
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+  function showMessage(text, type) {
+    const el = document.getElementById('message');
+    el.textContent = text;
+    el.className = type;
+    el.style.display = 'block';
+  }
+
+  function formatDate(d) {
+    return d.toISOString().split('T')[0];
+  }
+
+  // Pre-fill today / tomorrow
+  (function () {
+    const today = new Date();
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    document.getElementById('check-in').value = formatDate(today);
+    document.getElementById('check-out').value = formatDate(tomorrow);
+    document.getElementById('check-in').min = formatDate(today);
+  })();
+
+  // ── Search ──────────────────────────────────────────────────────────────────
+  async function searchAvailability() {
+    const checkIn  = document.getElementById('check-in').value;
+    const checkOut = document.getElementById('check-out').value;
+    if (!checkIn || !checkOut) return showMessage('Please select dates.', 'error');
+
+    document.getElementById('search-btn').disabled = true;
+    document.getElementById('availability-results').innerHTML = '<p style="color:#888;margin-top:1rem">Searching…</p>';
+    document.getElementById('guest-form').style.display = 'none';
+    document.getElementById('message').style.display = 'none';
+    selectedBed = null;
+
+    try {
+      let url = `${API_BASE}/availability?check_in=${checkIn}&check_out=${checkOut}`;
+      if (PROPERTY_ID) url += `&property_id=${PROPERTY_ID}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(await res.text());
+      const beds = await res.json();
+      renderBeds(beds, checkIn, checkOut);
+    } catch (e) {
+      document.getElementById('availability-results').innerHTML = '';
+      showMessage('Error fetching availability: ' + e.message, 'error');
+    } finally {
+      document.getElementById('search-btn').disabled = false;
+    }
+  }
+
+  function renderBeds(beds, checkIn, checkOut) {
+    const el = document.getElementById('availability-results');
+    if (!beds.length) {
+      el.innerHTML = '<p style="margin-top:1rem;color:#888">No beds available for those dates.</p>';
+      return;
+    }
+    el.innerHTML = '<p style="margin-top:1rem;font-size:.85rem;color:#666;margin-bottom:.5rem">Select a bed:</p>' +
+      beds.map(b => `
+        <div class="bed-card" id="bed-${b.bed_id}" onclick="selectBed(${JSON.stringify(b).replace(/"/g,'&quot;')})">
+          <h4>${b.bed_name} — ${b.room_name}</h4>
+          <p>${capitalize(b.bed_type.replace('_',' '))} · ${capitalize(b.room_type)} room · ${b.property_name}</p>
+          <p class="price">${b.price_per_night ? '$'+b.price_per_night+'/night · Total $'+b.total_price : 'Price on request'}</p>
+        </div>
+      `).join('');
+  }
+
+  function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+  function selectBed(bed) {
+    selectedBed = bed;
+    document.querySelectorAll('.bed-card').forEach(c => c.classList.remove('selected'));
+    document.getElementById('bed-' + bed.bed_id).classList.add('selected');
+    document.getElementById('guest-form').style.display = 'block';
+    document.getElementById('message').style.display = 'none';
+  }
+
+  // ── Book ────────────────────────────────────────────────────────────────────
+  async function submitBooking() {
+    if (!selectedBed) return showMessage('Please select a bed first.', 'error');
+
+    const first = document.getElementById('first-name').value.trim();
+    const last  = document.getElementById('last-name').value.trim();
+    const email = document.getElementById('email').value.trim();
+    if (!first || !last || !email) return showMessage('Please fill in your name and email.', 'error');
+
+    const payload = {
+      bed_id:           selectedBed.bed_id,
+      check_in:         document.getElementById('check-in').value,
+      check_out:        document.getElementById('check-out').value,
+      guest_first_name: first,
+      guest_last_name:  last,
+      guest_email:      email,
+      guest_phone:      document.getElementById('phone').value.trim() || null,
+      notes:            document.getElementById('notes').value.trim() || null,
+      secret:           WEBHOOK_SECRET,
+    };
+
+    document.getElementById('book-btn').disabled = true;
+    try {
+      const res = await fetch(`${API_BASE}/webhook/booking`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.status === 201) {
+        const booking = await res.json();
+        document.getElementById('availability-results').innerHTML = '';
+        document.getElementById('guest-form').style.display = 'none';
+        showMessage(`Booking confirmed! Reference: ${booking.id}`, 'success');
+      } else {
+        const err = await res.json();
+        showMessage(err.detail || 'Booking failed.', 'error');
+      }
+    } catch (e) {
+      showMessage('Network error: ' + e.message, 'error');
+    } finally {
+      document.getElementById('book-btn').disabled = false;
+    }
+  }
+</script>
+</body>
+</html>
