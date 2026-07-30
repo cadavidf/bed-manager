@@ -6,6 +6,7 @@ completes a booking on your website.
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -35,8 +36,6 @@ async def receive_webhook_booking(body: WebhookBookingPayload, db: AsyncSession 
     if await _check_conflict(db, body.bed_id, body.check_in, body.check_out):
         raise HTTPException(status_code=409, detail="Bed is not available for the requested dates")
 
-    # Find or create guest by email
-    from sqlalchemy import select
     result = await db.execute(
         select(Guest).where(Guest.email == body.guest_email.lower())
     )
