@@ -1,305 +1,175 @@
-import logging
-import re
-from datetime import date
+import asyncio
+import json
+import subprocess
+from collections import defaultdict
 
-from sqlalchemy import select
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    ConversationHandler,
-    MessageHandler,
-    filters,
-)
+import httpx
+from openai import AsyncOpenAI
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from app.config import settings
-from app.database import AsyncSessionLocal
-from app.models import Booking, BookingSource, BookingStatus, Guest
-from app.services.availability import get_available_beds
-
-logger = logging.getLogger(__name__)
-
-CHOOSING, CHECKIN, CHECKOUT, SELECT_BED, GUEST_NAME, GUEST_EMAIL, CONFIRM = range(7)
 
 _app: Application | None = None
+_client: AsyncOpenAI | None = None
+_histories: dict[int, list] = defaultdict(list)
+
+ADMIN_SYSTEM = """You are AmaunaBot, the AI admin assistant for an AWS EC2 bed-booking server.
+You can run shell commands and call the bed-manager REST API.
+Key Docker services: bed-manager (port 13377), n8n, caddy, postgres.
+Be concise. Use Telegram markdown (*bold*, `code`). Ask before destructive ops (restart, delete).
+Always reply in the same language the user writes in."""
+
+GUEST_SYSTEM = """You are AmaunaBot, a friendly booking assistant for Amauna accommodations.
+Help guests check availability and book beds.
+To book, collect: check-in date (YYYY-MM-DD), check-out date, full name, email — then confirm and create the booking.
+Always reply in the same language the user writes in."""
+
+ADMIN_TOOLS = [
+    {"type": "function", "function": {
+        "name": "shell_exec",
+        "description": "Run a shell command on the server (docker, system info, etc.)",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string"}
+        }, "required": ["command"]},
+    }},
+    {"type": "function", "function": {
+        "name": "api_get",
+        "description": "GET the bed-manager REST API. Paths: /bookings, /beds, /rooms, /properties, /availability?check_in=YYYY-MM-DD&check_out=YYYY-MM-DD",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}
+        }, "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "api_post",
+        "description": "POST to bed-manager REST API. path e.g. /bookings, /guests. body: JSON string.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "body": {"type": "string"},
+        }, "required": ["path", "body"]},
+    }},
+    {"type": "function", "function": {
+        "name": "api_delete",
+        "description": "DELETE via bed-manager REST API. path e.g. /bookings/{id}",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}
+        }, "required": ["path"]},
+    }},
+]
+
+GUEST_TOOLS = [
+    {"type": "function", "function": {
+        "name": "api_get",
+        "description": "GET the bed-manager REST API. Paths: /availability?check_in=YYYY-MM-DD&check_out=YYYY-MM-DD, /beds, /rooms",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"}
+        }, "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "api_post",
+        "description": "POST to bed-manager REST API. Use /bookings to create a booking, /guests to create a guest.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "body": {"type": "string"},
+        }, "required": ["path", "body"]},
+    }},
+]
+
+
+async def _run_tool(name: str, args: dict) -> str:
+    if name == "shell_exec":
+        r = subprocess.run(args["command"], shell=True, capture_output=True, text=True, timeout=30)
+        out = (r.stdout + r.stderr).strip()
+        return out[:3000] or "(no output)"
+    if name == "api_get":
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"http://localhost:13377{args['path']}", timeout=10)
+        return r.text[:3000]
+    if name == "api_post":
+        async with httpx.AsyncClient() as c:
+            r = await c.post(f"http://localhost:13377{args['path']}",
+                             content=args["body"], headers={"Content-Type": "application/json"}, timeout=10)
+        return r.text[:3000]
+    if name == "api_delete":
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(f"http://localhost:13377{args['path']}", timeout=10)
+        return r.text[:3000]
+    return f"unknown tool: {name}"
+
+
+def _is_admin(chat_id: int) -> bool:
+    return str(chat_id) == settings.telegram_admin_chat_id
+
+
+async def _chat(chat_id: int, text: str) -> str:
+    admin = _is_admin(chat_id)
+    history = _histories[chat_id]
+    history.append({"role": "user", "content": text})
+    messages = [{"role": "system", "content": ADMIN_SYSTEM if admin else GUEST_SYSTEM}] + history
+
+    for _ in range(10):
+        resp = await _client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=ADMIN_TOOLS if admin else GUEST_TOOLS,
+        )
+        msg = resp.choices[0].message
+        messages.append(msg.model_dump(exclude_none=True))
+
+        if not msg.tool_calls:
+            break
+
+        for tc in msg.tool_calls:
+            result = await _run_tool(tc.function.name, json.loads(tc.function.arguments))
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+    _histories[chat_id] = messages[1:][-40:]
+    return msg.content or "..."
+
+
+async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    await update.message.chat.send_action("typing")
+    try:
+        reply = await _chat(chat_id, update.message.text)
+        await update.message.reply_text(reply, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ {e}")
+
+
+async def _cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _histories.pop(update.effective_chat.id, None)
+    await update.message.reply_text("Conversation reset.")
 
 
 async def notify_admin(text: str) -> None:
-    if _app is None or not settings.telegram_admin_chat_id:
+    if not _app or not settings.telegram_admin_chat_id:
         return
     try:
         await _app.bot.send_message(
-            chat_id=settings.telegram_admin_chat_id,
-            text=text,
-            parse_mode="HTML",
+            chat_id=settings.telegram_admin_chat_id, text=text, parse_mode="HTML"
         )
-    except Exception as exc:
-        logger.warning("Telegram admin notify failed: %s", exc)
-
-
-def _is_admin(update: Update) -> bool:
-    return bool(
-        settings.telegram_admin_chat_id
-        and str(update.effective_chat.id) == settings.telegram_admin_chat_id
-    )
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    keyboard = [[
-        InlineKeyboardButton("📅 Check Availability", callback_data="check"),
-        InlineKeyboardButton("🛏 Book a Bed", callback_data="book"),
-    ]]
-    if _is_admin(update):
-        keyboard.append([InlineKeyboardButton("📋 Upcoming Bookings", callback_data="admin_list")])
-    await update.message.reply_text(
-        "👋 Welcome to *Bed Manager*! What would you like to do?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return CHOOSING
-
-
-async def btn_choosing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "admin_list":
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(
-                select(Booking)
-                .where(Booking.status.in_([BookingStatus.confirmed, BookingStatus.pending]))
-                .order_by(Booking.check_in)
-                .limit(10)
-            )
-            bookings = result.scalars().all()
-        if not bookings:
-            await query.edit_message_text("No upcoming bookings.")
-        else:
-            lines = ["📋 *Upcoming Bookings:*\n"]
-            for b in bookings:
-                lines.append(f"• `{b.id[:8]}` {b.check_in} → {b.check_out} [{b.status.value}]")
-            await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
-        return ConversationHandler.END
-
-    context.user_data["action"] = query.data
-    await query.edit_message_text("📅 Enter *check-in date* (YYYY-MM-DD):", parse_mode="Markdown")
-    return CHECKIN
-
-
-async def get_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        context.user_data["check_in"] = date.fromisoformat(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ Invalid date. Use YYYY-MM-DD (e.g. 2026-08-01):")
-        return CHECKIN
-    await update.message.reply_text("📅 Enter *check-out date* (YYYY-MM-DD):", parse_mode="Markdown")
-    return CHECKOUT
-
-
-async def get_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        check_out = date.fromisoformat(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ Invalid date. Use YYYY-MM-DD:")
-        return CHECKOUT
-
-    check_in: date = context.user_data["check_in"]
-    if check_out <= check_in:
-        await update.message.reply_text("❌ Check-out must be after check-in:")
-        return CHECKOUT
-    context.user_data["check_out"] = check_out
-
-    async with AsyncSessionLocal() as db:
-        beds = await get_available_beds(db, check_in, check_out)
-
-    if not beds:
-        await update.message.reply_text("😔 No beds available for those dates. /start to try again.")
-        return ConversationHandler.END
-
-    if context.user_data["action"] == "check":
-        lines = [f"✅ *Available ({check_in} → {check_out}):*\n"]
-        for b in beds:
-            price = f"${b['price_per_night']:.0f}/night" if b["price_per_night"] else "price TBD"
-            lines.append(f"• {b['bed_name']} — {b['room_name']} — {price}")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-        return ConversationHandler.END
-
-    context.user_data["beds"] = beds
-    keyboard = [
-        [InlineKeyboardButton(
-            f"{b['bed_name']} ({b['room_name']})"
-            + (f" · ${b['price_per_night']:.0f}/night" if b["price_per_night"] else ""),
-            callback_data=f"bed_{i}",
-        )]
-        for i, b in enumerate(beds)
-    ]
-    await update.message.reply_text("🛏 Select a bed:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return SELECT_BED
-
-
-async def select_bed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    idx = int(query.data.split("_")[1])
-    context.user_data["bed"] = context.user_data["beds"][idx]
-    await query.edit_message_text("👤 Enter your *full name* (First Last):", parse_mode="Markdown")
-    return GUEST_NAME
-
-
-async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    parts = update.message.text.strip().split(None, 1)
-    if len(parts) < 2:
-        await update.message.reply_text("Please enter first and last name (e.g. John Smith):")
-        return GUEST_NAME
-    context.user_data["first_name"], context.user_data["last_name"] = parts[0], parts[1]
-    await update.message.reply_text("📧 Enter your *email address*:", parse_mode="Markdown")
-    return GUEST_EMAIL
-
-
-async def get_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    email = update.message.text.strip().lower()
-    if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
-        await update.message.reply_text("❌ Invalid email, try again:")
-        return GUEST_EMAIL
-    context.user_data["email"] = email
-
-    d = context.user_data
-    bed = d["bed"]
-    nights = (d["check_out"] - d["check_in"]).days
-    total = f"${bed['price_per_night'] * nights:.0f}" if bed["price_per_night"] else "N/A"
-
-    await update.message.reply_text(
-        f"📋 *Booking Summary*\n\n"
-        f"🛏 {bed['bed_name']} — {bed['room_name']}\n"
-        f"📅 {d['check_in']} → {d['check_out']} ({nights} nights)\n"
-        f"👤 {d['first_name']} {d['last_name']}\n"
-        f"📧 {email}\n"
-        f"💰 Total: {total}",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Confirm", callback_data="confirm"),
-            InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
-        ]]),
-    )
-    return CONFIRM
-
-
-async def confirm_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "cancel":
-        await query.edit_message_text("❌ Booking cancelled. /start to begin again.")
-        return ConversationHandler.END
-
-    d = context.user_data
-    bed = d["bed"]
-    nights = (d["check_out"] - d["check_in"]).days
-    total = bed["price_per_night"] * nights if bed["price_per_night"] else None
-
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Guest).where(Guest.email == d["email"]))
-        guest = result.scalar_one_or_none()
-        if not guest:
-            guest = Guest(first_name=d["first_name"], last_name=d["last_name"], email=d["email"])
-            db.add(guest)
-            await db.flush()
-
-        booking = Booking(
-            bed_id=bed["bed_id"],
-            guest_id=guest.id,
-            check_in=d["check_in"],
-            check_out=d["check_out"],
-            status=BookingStatus.confirmed,
-            source=BookingSource.direct,
-            total_price=total,
-        )
-        db.add(booking)
-        await db.commit()
-        await db.refresh(booking)
-
-    await query.edit_message_text(
-        f"✅ *Booking confirmed!*\n\n"
-        f"ID: `{booking.id[:8]}`\n"
-        f"Check-in: {d['check_in']}\n"
-        f"Check-out: {d['check_out']}\n\n"
-        f"See you soon! 🏨",
-        parse_mode="Markdown",
-    )
-    await notify_admin(
-        f"🔔 <b>New Telegram Booking</b>\n"
-        f"Bed: {bed['bed_name']} ({bed['room_name']})\n"
-        f"Guest: {d['first_name']} {d['last_name']} ({d['email']})\n"
-        f"Dates: {d['check_in']} → {d['check_out']}\n"
-        f"ID: <code>{booking.id[:8]}</code>"
-    )
-    return ConversationHandler.END
-
-
-async def cmd_cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update):
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /cancel_booking <id_prefix>")
-        return
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Booking).where(Booking.id.startswith(context.args[0])))
-        booking = result.scalar_one_or_none()
-        if not booking:
-            await update.message.reply_text(f"Booking `{context.args[0]}` not found.", parse_mode="Markdown")
-            return
-        booking.status = BookingStatus.cancelled
-        await db.commit()
-    await update.message.reply_text(f"✅ Booking `{context.args[0]}` cancelled.", parse_mode="Markdown")
-
-
-async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("❌ Cancelled. /start to begin again.")
-    return ConversationHandler.END
-
-
-def _build_app(token: str) -> Application:
-    app = Application.builder().token(token).build()
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", cmd_start)],
-        states={
-            CHOOSING:   [CallbackQueryHandler(btn_choosing, pattern="^(check|book|admin_list)$")],
-            CHECKIN:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_checkin)],
-            CHECKOUT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_checkout)],
-            SELECT_BED: [CallbackQueryHandler(select_bed, pattern=r"^bed_\d+$")],
-            GUEST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
-            GUEST_EMAIL:[MessageHandler(filters.TEXT & ~filters.COMMAND, get_email)],
-            CONFIRM:    [CallbackQueryHandler(confirm_booking, pattern="^(confirm|cancel)$")],
-        },
-        fallbacks=[CommandHandler("cancel", conv_cancel)],
-        per_user=True,
-    )
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("cancel_booking", cmd_cancel_booking))
-    return app
+    except Exception:
+        pass
 
 
 async def start_bot() -> None:
-    global _app
-    if not settings.telegram_bot_token:
-        logger.info("TELEGRAM_BOT_TOKEN not set — bot disabled.")
+    global _app, _client
+    if not settings.telegram_bot_token or not settings.openai_api_key:
         return
-    _app = _build_app(settings.telegram_bot_token)
+    _client = AsyncOpenAI(api_key=settings.openai_api_key)
+    _app = Application.builder().token(settings.telegram_bot_token).build()
+    _app.add_handler(CommandHandler("reset", _cmd_reset))
+    _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
     await _app.initialize()
     await _app.start()
     await _app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Telegram bot polling started.")
 
 
 async def stop_bot() -> None:
     global _app
-    if _app is None:
-        return
-    await _app.updater.stop()
-    await _app.stop()
-    await _app.shutdown()
-    _app = None
+    if _app:
+        await _app.updater.stop()
+        await _app.stop()
+        await _app.shutdown()
+        _app = None

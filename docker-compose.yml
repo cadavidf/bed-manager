@@ -19,10 +19,10 @@ services:
     restart: unless-stopped
     ports:
       - "13377:13377"
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql+asyncpg://bedmanager:bedmanager@db:5432/bedmanager
-      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-change-me-in-production}
-      ICAL_POLL_INTERVAL_MINUTES: ${ICAL_POLL_INTERVAL_MINUTES:-60}
     depends_on:
       db:
         condition: service_healthy

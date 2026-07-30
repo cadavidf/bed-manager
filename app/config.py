@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     app_port: int = 13377
     telegram_bot_token: str = ""
     telegram_admin_chat_id: str = ""
+    openai_api_key: str = ""
     whatsapp_token: str = ""
     whatsapp_phone_number_id: str = ""
     whatsapp_verify_token: str = "bed-manager-verify"
