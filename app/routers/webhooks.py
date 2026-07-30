@@ -14,6 +14,7 @@ from app.database import get_db
 from app.models import Bed, Booking, BookingSource, BookingStatus, Guest
 from app.routers.bookings import _check_conflict
 from app.schemas import BookingOut, WebhookBookingPayload
+from app.services.telegram_bot import notify_admin
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhook", tags=["webhook"])
@@ -65,4 +66,10 @@ async def receive_webhook_booking(body: WebhookBookingPayload, db: AsyncSession 
     await db.refresh(booking)
 
     logger.info("Webhook booking created: %s for guest %s", booking.id, guest.email)
+    await notify_admin(
+        f"🔔 <b>New Webhook Booking</b>\n"
+        f"Guest: {body.guest_first_name} {body.guest_last_name} ({body.guest_email})\n"
+        f"Dates: {body.check_in} → {body.check_out}\n"
+        f"ID: <code>{booking.id[:8]}</code>"
+    )
     return booking

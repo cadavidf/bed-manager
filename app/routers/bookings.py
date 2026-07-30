@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models import Bed, Booking, BookingStatus, Guest
 from app.schemas import BookingCreate, BookingOut, BookingUpdate
+from app.services.telegram_bot import notify_admin
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
@@ -58,6 +59,13 @@ async def create_booking(body: BookingCreate, db: AsyncSession = Depends(get_db)
     db.add(booking)
     await db.commit()
     await db.refresh(booking)
+    await notify_admin(
+        f"🔔 <b>New Booking</b> (API)\n"
+        f"Bed: <code>{body.bed_id[:8]}</code>\n"
+        f"Dates: {body.check_in} → {body.check_out}\n"
+        f"Source: {body.source.value}\n"
+        f"ID: <code>{booking.id[:8]}</code>"
+    )
     return booking
 
 

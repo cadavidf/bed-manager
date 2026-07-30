@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
 from app.models import Booking, BookingSource, BookingStatus, ExternalCalendar
+from app.services.telegram_bot import notify_admin
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,9 @@ async def sync_external_calendar(db: AsyncSession, calendar: ExternalCalendar) -
 
     if count:
         await db.commit()
+        await notify_admin(
+            f"📅 <b>iCal Sync</b>: {count} new booking(s) from <b>{calendar.name}</b> ({calendar.platform})"
+        )
 
     calendar.last_synced = datetime.now(timezone.utc)
     await db.commit()
